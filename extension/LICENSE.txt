@@ -1,10 +1,5 @@
 MIT License
 
-Reference project: 党旗飘飘~~~UESTC, version 1.4.0
-Author: Onion / Onion_Big
-https://greasyfork.org/zh-CN/scripts/442470
-The reference project declares the MIT license in its userscript metadata.
-
 Copyright (c) Onion / Onion_Big
 Copyright (c) 2026 UIBE learning helper adaptation contributors
 
