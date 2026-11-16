@@ -2,7 +2,7 @@
 
 用于 `jjfz.uibe.edu.cn` 的 Chrome 扩展，提供课程目录、平台完成状态、播放进度和常规提示处理。
 
-当前为 **1.1.0 开发测试版，尚未发布新版 Release**。
+当前为 **1.1.0 公开测试版**。离线检查通过，真实平台在线流程仍待实测。
 
 ## 功能
 
@@ -23,7 +23,7 @@
 
 需要支持 Manifest V3 的 Chrome 102 或更新版本。
 
-1. 将提供的 `uibe-jjfz-learning-helper-v1.1.0.zip` 测试安装包解压到长期保留的文件夹，或直接使用仓库中的 `extension/` 文件夹。
+1. 从 [v1.1.0 发布页](https://github.com/Opraian/uibe-jjfz-learning-helper/releases/tag/v1.1.0) 下载 `uibe-jjfz-learning-helper-v1.1.0.zip`，解压到长期保留的文件夹；也可直接使用仓库中的 `extension/` 文件夹。
 2. 在 Chrome 地址栏输入 `chrome://extensions`，打开右上角“开发者模式”。
 3. 点击“加载已解压的扩展程序”，选择**直接包含 `manifest.json` 的文件夹**。
 4. 刷新 UIBE jjfz 课程页或播放页，右下角会出现助手。
