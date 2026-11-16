@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "UIBE jjfz 学习助手",
+  "version": "1.0.1",
+  "minimum_chrome_version": "102",
+  "description": "读取平台课程状态，显示播放进度，处理常规继续学习提示，确认完成后提供下一节入口。",
+  "permissions": ["storage"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [{
+    "matches": ["http://jjfz.uibe.edu.cn/*", "https://jjfz.uibe.edu.cn/*"],
+    "js": ["content.js"],
+    "run_at": "document_idle"
+  }],
+  "action": { "default_popup": "help.html", "default_title": "UIBE jjfz 学习助手" }
+}
