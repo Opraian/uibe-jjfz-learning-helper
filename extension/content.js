@@ -1,5 +1,5 @@
 /*
- * UIBE jjfz 学习助手 v1.0.1 — MIT
+ * UIBE jjfz 学习助手 v1.1.0 — MIT
  * Adaptation reference: Onion / Onion_Big, 党旗飘飘~~~UESTC 1.4.0 (MIT)
  * https://greasyfork.org/zh-CN/scripts/442470
  * Retains its course-selector, start/stop, dialog-click and next-chapter approach.
@@ -10,16 +10,20 @@
   'use strict';
   if (location.hostname !== 'jjfz.uibe.edu.cn' || window.top !== window) return;
   if (document.getElementById('uibe-learning-helper')) return;
-  const playPage = /^\/jjfz\/play\/?$/.test(location.pathname);
-  const lessonPage = /^\/(?:jjfz\/lesson(?:\/video)?|user\/lesson)\/?$/.test(location.pathname);
+  const Site = globalThis.UIBEHelperSite;
+  const pageInfo = Site.info(location.href);
+  const playPage = pageInfo.play;
+  const lessonPage = pageInfo.hub || pageInfo.chapter;
   const loginPage = /\/(?:login|logout)(?:\/|$)/.test(location.pathname);
   if (!playPage && !lessonPage && !loginPage) return;
 
-  const DEFAULTS = { autoDialogs: true, autoNext: false, collapsed: false };
+  const DEFAULTS = { autoDialogs: true, autoNext: false, autoResume: true, collapsed: false };
   let settings = { ...DEFAULTS };
   let running = false, fault = '', pending = false, media = null;
   let ended = false, confirmed = false, navigating = false, clickedCount = 0;
   let listSignature = '', lastAnnouncement = '', initDone = false;
+  let workflow = null, sequenceDone = '', needsGesture = false, playPending = false;
+  let lastPlayAttempt = -Infinity;
   const processed = new WeakSet();
   const logs = [];
   const currentParams = new URL(location.href).searchParams;
@@ -43,8 +47,9 @@
       <div id="course">正在识别课程…</div><div id="chapter"></div>
       <div id="status" role="status" aria-live="polite"></div>
       <progress id="progress" max="100" value="0" aria-label="视频播放进度"></progress><div id="time">等待视频信息</div>
-      <div class="actions"><button id="toggle">开启辅助</button><a id="next" aria-disabled="true">下一节</a><a id="back" hidden>返回课程页</a></div>
+      <div class="actions"><button id="toggle">开启辅助</button><button id="playNow" hidden>点击继续播放</button><a id="next" aria-disabled="true">下一节</a><a id="back" hidden>返回课程页</a></div>
       <label><input id="dialogs" type="checkbox">自动点击常规继续学习 / 结束提示</label>
+      <label><input id="resume" type="checkbox">暂停后自动尝试继续播放</label>
       <label><input id="autoNext" type="checkbox">平台确认完成后自动进入下一节</label>
       <details open><summary id="catalogTitle">课程目录</summary><ul id="catalog"></ul></details>
       <details><summary>本页运行记录</summary><ul id="logs"></ul></details>
@@ -69,16 +74,20 @@
   }
   function safeLink(anchor) {
     try {
-      const url = new URL(anchor.getAttribute('href'), location.href);
+      const href = Site.safeURL(anchor.getAttribute('href'), location.href);
+      if (!href) return null;
+      const url = new URL(href);
       return url.origin === location.origin && url.pathname === '/jjfz/play' && url.searchParams.has('v_id') ? url.href : null;
     } catch { return null; }
   }
   function platformDone(anchor) {
     const li = anchor.closest('li');
     return anchor.classList.contains('dd_cut_on') || li?.classList.contains('video_red2') ||
+      Boolean(li && !li.querySelector('.lesson1_a a[href]') && normalize(li.querySelector('.lesson_pass')?.textContent) === '完成') ||
       ['red', 'rgb(255, 0, 0)', '#ff0000'].includes(anchor.style.color.toLowerCase());
   }
   function readCatalog() {
+    if (pageInfo.hub) return Site.readChapters(document, location.href).map(item => ({ ...item, kind: 'chapter', selected: false }));
     const selectors = playPage ? '.video_lists li a[href]' : '.lesson1_a a[href], .l_list_right h2 a[href]';
     const found = [], seen = new Set();
     for (const anchor of document.querySelectorAll(selectors)) {
@@ -91,7 +100,7 @@
       if (seen.has(key)) continue;
       seen.add(key);
       const selected = Boolean(playPage && (currentRid ? rid === currentRid : anchor.closest('li')?.classList.contains('video_red1')));
-      found.push({ href, rid, vid, title: normalize(anchor.textContent), done: platformDone(anchor), selected });
+      found.push({ href, rid, vid, title: normalize(anchor.textContent), done: platformDone(anchor), selected, anchor, card: anchor.closest('.lesson1_lists > ul > li') });
     }
     return found;
   }
@@ -110,11 +119,82 @@
     if (text === '您需要完整观看一遍课程视频，才能获取本课学时，看到视频播放完毕提示框即为完成，然后视频可以拖动播放。') return { type: 'intro', text, button: find('我知道了') };
     return { type: 'unknown', text };
   }
-  async function send(type) { return chrome.runtime.sendMessage({ type }); }
+  async function send(type, extra = {}) { return chrome.runtime.sendMessage({ type, ...extra }); }
+  async function navigate(href, nextWorkflow = workflow) {
+    const target = Site.safeURL(href, location.href);
+    if (!target) { pause('页面提供的目标地址无法识别，请检查课程入口'); return; }
+    if (navigating || !running) return;
+    navigating = true;
+    try {
+      const result = await send('updateWorkflow', { workflow: nextWorkflow });
+      if (result.error) throw new Error('状态保存失败');
+      if (!running || !result.running) { navigating = false; return; }
+      workflow = nextWorkflow;
+      log(`进入：${new URL(target).pathname}`);
+      location.assign(target);
+    } catch { pause('课程切换状态保存失败，请重新开启辅助'); }
+  }
+  async function startRun(nextWorkflow = workflow) {
+    const result = await send('start', { workflow: nextWorkflow });
+    if (result.error) throw new Error('状态保存失败');
+    running = result.running; workflow = result.workflow || null;
+    fault = ''; navigating = false; needsGesture = false; sequenceDone = '';
+    lastPlayAttempt = -Infinity;
+    log('辅助已开启；本标签页独立运行');
+  }
+  async function openEntry(item) {
+    if (pending) return;
+    pending = true;
+    try {
+      if (item.kind === 'chapter') {
+        await startRun(Site.workflow([item], location.href));
+        tick();
+      } else {
+        await startRun(null);
+        await navigate(item.href, null);
+      }
+    } catch { pause('视频辅助入口启动失败，请刷新页面'); }
+    finally { pending = false; tick(); }
+  }
+  function injectEntryButtons(catalog) {
+    if (playPage || loginPage) return;
+    const groups = new Map();
+    for (const item of catalog) {
+      const container = item.card || item.anchor?.closest('li') || item.anchor?.parentElement;
+      if (!container) continue;
+      if (!groups.has(container)) groups.set(container, []);
+      groups.get(container).push(item);
+    }
+    for (const [container, items] of groups) {
+      let button = container.querySelector('button[data-uibe-entry]');
+      if (!button) {
+        button = document.createElement('button'); button.type = 'button'; button.dataset.uibeEntry = 'true';
+        button.style.cssText = 'display:inline-block;margin:8px;padding:5px 12px;border:1px solid #a32d3b;border-radius:6px;background:#fff;color:#a32d3b;cursor:pointer;font-size:13px';
+        (container.querySelector('.l_list_right, .lesson_ul_title') || container).append(button);
+      }
+      const target = items.find(item => !item.done);
+      button.disabled = !target;
+      button.textContent = target ? (target.kind === 'chapter' ? '辅助本章必修' : '进入并辅助') : '平台已标记完成';
+      button.onclick = event => { event.preventDefault(); event.stopPropagation(); if (target) void openEntry(target); };
+    }
+  }
+  function attemptPlay(force = false) {
+    if (!playPage || !running || fault || !media || media.ended || ended || confirmed || navigating || !media.paused || media.readyState < 2 || document.visibilityState !== 'visible') return;
+    if (playPending || (!force && (!settings.autoResume || needsGesture || Date.now() - lastPlayAttempt < 3000))) return;
+    lastPlayAttempt = Date.now(); playPending = true;
+    try {
+      Promise.resolve(media.play()).then(() => { needsGesture = false; ui('playNow').hidden = true; }, error => {
+        if (!running) return;
+        if (error?.name === 'NotAllowedError') {
+          needsGesture = true; ui('playNow').hidden = false; log('浏览器要求点击播放，请点击“点击继续播放”');
+        } else if (error?.name !== 'AbortError') pause('播放器无法继续播放，请检查网站提示');
+      }).finally(() => { playPending = false; });
+    } catch { playPending = false; pause('播放器无法继续播放，请检查网站提示'); }
+  }
   function pause(reason, record = true) {
     if (fault === reason && !running) return;
     const wasRunning = running;
-    running = false; fault = reason; navigating = false;
+    running = false; fault = reason; navigating = false; needsGesture = false;
     if (media && !media.paused && !media.ended) media.pause();
     if (wasRunning) void send('stop').catch(() => {});
     if (record) log(reason);
@@ -124,7 +204,7 @@
     if (nextMedia === media) return;
     if (media) media.removeEventListener('ended', onEnded);
     media = nextMedia;
-    ended = false; confirmed = false;
+    ended = false; confirmed = false; needsGesture = false; lastPlayAttempt = -Infinity;
     if (media) { media.addEventListener('ended', onEnded); log('已连接当前视频'); }
   }
   function onEnded() {
@@ -140,17 +220,23 @@
     return minutes >= 60 ? `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, '0')}:${remainder}` : `${minutes}:${remainder}`;
   }
   function render(catalog, current, next, dialogs) {
-    put('course', normalize(document.querySelector('.video_cont h2, .video_head h3')?.textContent) || (loginPage ? '党校登录页' : '课程列表'));
-    put('chapter', current ? `当前章节 · ${current.title}` : (playPage ? '当前章节尚未识别' : `本页识别 ${catalog.length} 个章节 / 课程入口`));
+    put('course', normalize(document.querySelector('.video_cont h2, .video_head h3, .lesson_h1')?.textContent) || (loginPage ? '党校登录页' : pageInfo.hub ? '综合课程列表' : '课程列表'));
+    put('chapter', current ? `当前章节 · ${current.title}` : (workflow ? `章节必修辅助 · ${workflow.index + 1}/${workflow.chapters.length}` : playPage ? '当前章节尚未识别' : `本页识别 ${catalog.length} 个章节 / 课程入口`));
     let status = running ? '辅助已开启，正在正常学习' : '辅助未开启，可查看目录和播放进度';
     if (playPage && !media) status = '等待播放器加载';
-    if (media?.paused && !ended && running) status = document.visibilityState === 'hidden' ? '页面在后台，保留平台暂停行为' : '视频已暂停，请使用网站播放按钮继续';
+    if (media?.paused && !ended && running) status = document.visibilityState === 'hidden' ? '页面在后台，保留平台暂停行为' : settings.autoResume ? '视频已暂停，正在尝试恢复播放' : '视频已暂停，自动续播已关闭';
+    if (needsGesture && running) status = '浏览器要求手动点击，请点击“点击继续播放”';
+    if (workflow && !playPage && running) status = '正在进入本章“精品课程 → 必修”';
     if (ended && !confirmed) status = '视频已结束，等待平台完成确认';
     if (confirmed) status = next ? '平台已确认完成，可以进入下一节' : '本节已完成，本课程没有后续未完成章节';
     if (dialogs.length && !fault && !running) status = '页面有提示；开启辅助后可处理已识别的常规提示';
     if (fault) status = `已停止：${fault}`;
+    else if (sequenceDone) status = sequenceDone;
     put('status', status); ui('status').dataset.fault = String(Boolean(fault));
-    put('toggle', running ? '停止辅助' : '开启辅助'); ui('toggle').disabled = pending;
+    put('toggle', running ? '停止辅助' : lessonPage ? '开始必修辅助' : '开启辅助'); ui('toggle').disabled = pending;
+    ui('playNow').hidden = !(running && needsGesture && !fault);
+    ui('autoNext').checked = Boolean(workflow) || settings.autoNext;
+    ui('autoNext').disabled = Boolean(workflow);
     const duration = media?.duration, time = media?.currentTime;
     ui('progress').value = Number.isFinite(duration) && duration > 0 ? Math.min(100, Math.max(0, time / duration * 100)) : 0;
     put('time', media ? `${formatTime(time)} / ${formatTime(duration)} · ${Number.isFinite(duration) ? formatTime(Math.max(0, duration - time)) : '--:--'} 剩余` : '等待视频信息');
@@ -170,6 +256,7 @@
       ui('catalog').replaceChildren(...catalog.map(item => {
         const li = document.createElement('li'), a = document.createElement('a'), badge = document.createElement('small');
         a.href = item.href; a.textContent = item.title; li.dataset.current = String(item.selected);
+        a.addEventListener('click', event => { event.preventDefault(); void openEntry(item); });
         badge.textContent = item.done ? '平台已标记完成' : '未标记完成';
         li.append(a, badge); return li;
       }));
@@ -180,8 +267,9 @@
     if (!initDone) return;
     bindMedia();
     const catalog = readCatalog(), index = catalog.findIndex(item => item.selected), current = catalog[index];
+    injectEntryButtons(catalog);
     if (current?.done) confirmed = true;
-    const next = index >= 0 ? catalog.slice(index + 1).find(item => !item.done) : null;
+    const next = index >= 0 ? catalog.slice(index + 1).find(item => !item.done) || (workflow ? catalog.slice(0, index).find(item => !item.done) : null) : null;
     const dialogs = [...document.querySelectorAll('.public_cont, .layui-layer-dialog, [role="alertdialog"]')].filter(visible);
     const classified = dialogs.map(classify);
     const verification = [...document.querySelectorAll('.verifybox, .verify-box, .geetest_panel, .nc-container, [id*="captcha"], [class*="captcha"], iframe[src*="captcha"]')].some(visible);
@@ -192,7 +280,7 @@
       else if (bad) pause(`请检查平台提示：${bad.text.slice(0, 100) || '未识别的弹窗'}`);
       else if (media?.error) pause('视频加载错误，请检查网站播放器后重新开启');
       else if (playPage && !current) pause('当前章节无法识别，已停止自动操作');
-      else if (playPage && !media) pause('当前播放器尚未就绪，请加载完成后重新开启');
+      else if (playPage && !media) { render(catalog, current, next, dialogs); return; }
       else {
         const completed = classified.find(item => item.type === 'completed');
         if (completed) confirmed = true;
@@ -207,9 +295,20 @@
             render(catalog, current, next, dialogs);
             return; // Completion acknowledgement may reload; only navigate after fresh platform markup.
           }
-          if (confirmed && settings.autoNext && next && !dialogs.length && !navigating) {
-            navigating = true; log(`平台已确认完成，进入：${next.title}`);
-            location.assign(next.href);
+          if (!dialogs.length && !navigating) {
+            if (workflow) {
+              const action = Site.plan(document, location.href, workflow, catalog, confirmed, next);
+              if (action.kind === 'navigate') void navigate(action.href, action.workflow);
+              else if (action.kind === 'stop') pause(action.text);
+              else if (action.kind === 'done') {
+                sequenceDone = action.text; running = false; workflow = null;
+                log(sequenceDone); void send('stop', { clearWorkflow: true }).catch(() => {});
+              }
+            } else if (confirmed && settings.autoNext && next) {
+              log(`平台已确认完成，进入：${next.title}`);
+              void navigate(next.href, null);
+            }
+            attemptPlay();
           }
         }
       }
@@ -225,15 +324,24 @@
     if (pending) return;
     pending = true;
     try {
-      const result = await send(running ? 'stop' : 'start');
-      if (result.error) throw new Error('状态保存失败');
-      running = result.running; fault = ''; navigating = false;
-      log(running ? '辅助已开启；仅此标签页自动操作' : '辅助已停止');
+      if (running) {
+        const result = await send('stop');
+        if (result.error) throw new Error('状态保存失败');
+        running = false; navigating = false; fault = ''; log('本标签页辅助已停止');
+      } else {
+        let flow = workflow;
+        if (lessonPage && !flow) {
+          const entries = pageInfo.hub ? readCatalog() : [{ href: location.href, lessonId: pageInfo.lessonId, title: normalize(document.querySelector('.lesson_h1')?.textContent) || '当前章节', done: false }];
+          if (!entries.length) { pause('未识别到章节入口，请检查综合课程列表'); return; }
+          flow = Site.workflow(entries, pageInfo.hub ? location.href : null);
+        }
+        await startRun(flow);
+      }
     } catch { pause('扩展连接失效，请刷新页面'); }
     finally { pending = false; tick(); }
   });
   function saveSettings() { void chrome.storage.local.set({ settings }).catch(() => pause('设置保存失败，请刷新页面')); }
-  for (const [id, key] of [['dialogs', 'autoDialogs'], ['autoNext', 'autoNext']]) {
+  for (const [id, key] of [['dialogs', 'autoDialogs'], ['autoNext', 'autoNext'], ['resume', 'autoResume']]) {
     ui(id).addEventListener('change', () => { settings[key] = ui(id).checked; saveSettings(); tick(); });
   }
   ui('fold').addEventListener('click', () => {
@@ -242,18 +350,23 @@
     put('fold', settings.collapsed ? '+' : '−');
     ui('fold').setAttribute('aria-label', settings.collapsed ? '展开面板' : '收起面板'); saveSettings();
   });
-  // Catalog shortcuts are manual; all automatic navigation is gated above.
-  ui('next').addEventListener('click', event => {
+  ui('playNow').addEventListener('click', () => {
     tick();
-    if (ui('next').getAttribute('aria-disabled') === 'true') event.preventDefault();
+    const dialogs = [...document.querySelectorAll('.public_cont, .layui-layer-dialog, [role="alertdialog"]')].some(visible);
+    if (!dialogs) attemptPlay(true);
   });
-  chrome.runtime.onMessage.addListener(message => {
-    if (message?.type === 'ownershipLost') { pause('另一标签页已开启辅助', false); tick(); }
+  ui('next').addEventListener('click', async event => {
+    event.preventDefault();
+    tick();
+    if (ui('next').getAttribute('aria-disabled') === 'true' || pending) return;
+    const href = ui('next').href;
+    try { await startRun(workflow); await navigate(href, workflow); }
+    catch { pause('下一节辅助启动失败，请刷新页面'); }
   });
   Promise.all([chrome.storage.local.get('settings'), send('state')]).then(([saved, state]) => {
     for (const key of Object.keys(DEFAULTS)) if (typeof saved.settings?.[key] === 'boolean') settings[key] = saved.settings[key];
-    running = Boolean(state.running); initDone = true;
-    ui('dialogs').checked = settings.autoDialogs; ui('autoNext').checked = settings.autoNext;
+    running = Boolean(state.running); workflow = state.workflow || null; initDone = true;
+    ui('dialogs').checked = settings.autoDialogs; ui('autoNext').checked = settings.autoNext; ui('resume').checked = settings.autoResume;
     root.querySelector('section').classList.toggle('collapsed', settings.collapsed);
     put('fold', settings.collapsed ? '+' : '−');
     ui('fold').setAttribute('aria-label', settings.collapsed ? '展开面板' : '收起面板');

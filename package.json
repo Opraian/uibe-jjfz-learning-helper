@@ -1,6 +1,6 @@
 {
   "name": "uibe-jjfz-learning-helper",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "private": true,
   "description": "UIBE jjfz 学习助手：课程状态、播放进度与常规提示辅助",
   "license": "MIT",
@@ -9,7 +9,7 @@
   },
   "scripts": {
     "test": "node --test tests/*.test.cjs",
-    "check": "node --check extension/content.js && node --check extension/background.js && node --check scripts/package.cjs",
+    "check": "node --check extension/site.js && node --check extension/content.js && node --check extension/background.js && node --check scripts/package.cjs",
     "package": "node scripts/package.cjs"
   },
   "devDependencies": {

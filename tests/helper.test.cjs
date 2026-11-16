@@ -6,25 +6,34 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const folder = path.resolve(__dirname, '../extension');
 const content = fs.readFileSync(path.join(folder, 'content.js'), 'utf8');
+const site = fs.readFileSync(path.join(folder, 'site.js'), 'utf8');
 const savedPlay = fs.readFileSync(path.join(__dirname, 'fixtures/play.html'), 'utf8');
 const savedLesson = fs.readFileSync(path.join(__dirname, 'fixtures/lesson.html'), 'utf8');
 const URL = 'http://jjfz.uibe.edu.cn/jjfz/play?v_id=101&r_id=201&r=video&pg=1';
 
-async function make({ html = savedPlay, url = URL, running = true, settings = {}, hidden = false } = {}) {
+async function make({ html = savedPlay, url = URL, running = true, settings = {}, hidden = false, initialPaused = false, workflow = null, denied = false } = {}) {
   const browserErrors = [], virtualConsole = new VirtualConsole();
   virtualConsole.on('jsdomError', error => browserErrors.push(error));
   const dom = new JSDOM(html, { url, runScripts: 'outside-only', pretendToBeVisual: true, virtualConsole });
   const w = dom.window;
-  const intervals = [], messages = [], writes = [], runtimeListeners = [];
-  let root, paused = false, ended = false, time = 15, duration = 328, pauses = 0, autoplay = 0;
+  const intervals = [], messages = [], requests = [], writes = [], runtimeListeners = [];
+  let root, paused = initialPaused, ended = false, time = 15, duration = 328, pauses = 0, autoplay = 0, now = 10000;
   const attach = w.Element.prototype.attachShadow;
   w.Element.prototype.attachShadow = function (options) { root = attach.call(this, options); return root; };
   w.Element.prototype.getClientRects = () => [{ x: 0, y: 0, width: 10, height: 10 }];
   Object.defineProperty(w.document, 'visibilityState', { configurable: true, get: () => hidden ? 'hidden' : 'visible' });
   w.setInterval = (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; };
+  w.Date.now = () => now;
   w.chrome = {
     runtime: {
-      sendMessage: async message => { messages.push(message.type); if (message.type === 'start') running = true; if (message.type === 'stop') running = false; return { running }; },
+      sendMessage: async message => {
+        messages.push(message.type); requests.push(JSON.parse(JSON.stringify(message)));
+        if (message.type === 'start') running = true;
+        if (message.type === 'stop') running = false;
+        if (Object.hasOwn(message, 'workflow')) workflow = message.workflow;
+        if (message.clearWorkflow) workflow = null;
+        return { running, workflow };
+      },
       onMessage: { addListener(fn) { runtimeListeners.push(fn); } }
     },
     storage: { local: { get: async () => ({ settings }), set: async value => writes.push(value) } }
@@ -36,11 +45,17 @@ async function make({ html = savedPlay, url = URL, running = true, settings = {}
       duration: { configurable: true, get: () => duration },
       ended: { configurable: true, get: () => ended },
       paused: { configurable: true, get: () => paused },
+      readyState: { configurable: true, get: () => 4 },
       playbackRate: { configurable: true, get: () => 1, set() { throw new Error('Extension must not change speed'); } }
     });
     video.pause = () => { pauses++; paused = true; };
-    video.play = () => { autoplay++; return Promise.resolve(); };
+    video.play = () => {
+      autoplay++;
+      if (denied) { const error = new Error('User gesture required'); error.name = 'NotAllowedError'; return Promise.reject(error); }
+      paused = false; return Promise.resolve();
+    };
   }
+  w.eval(site);
   w.eval(content);
   await new Promise(resolve => setImmediate(resolve));
   const ui = id => root?.getElementById(id);
@@ -59,10 +74,12 @@ async function make({ html = savedPlay, url = URL, running = true, settings = {}
     return { box, clicks };
   }
   return {
-    dom, w, ui, video, tick, dialog, intervals, messages, writes, browserErrors,
+    dom, w, ui, video, tick, dialog, intervals, messages, requests, writes, browserErrors,
     stats: () => ({ pauses, autoplay }),
     finish() { ended = true; time = duration; paused = true; video.dispatchEvent(new w.Event('ended')); },
-    loseOwner() { runtimeListeners.forEach(fn => fn({ type: 'ownershipLost' })); },
+    setPaused(value) { paused = value; },
+    advanceClock(ms) { now += ms; },
+    allowPlay() { denied = false; },
     close() { dom.window.close(); }
   };
 }
@@ -169,9 +186,12 @@ test('automation is off on a new tab until explicitly started', async () => {
   s.ui('toggle').click(); await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(d.clicks, ['继续']); s.close();
 });
-test('another active tab stops this tab and pauses its video', async () => {
-  const s = await make(); s.loseOwner(); await s.tick();
-  assert.match(s.ui('status').textContent, /另一标签页/); assert.equal(s.stats().pauses, 1); s.close();
+test('two content-script instances remain independently enabled', async () => {
+  const first = await make(), second = await make();
+  first.ui('toggle').click(); await first.tick(); await second.tick();
+  assert.equal(first.ui('toggle').textContent, '开启辅助');
+  assert.equal(second.ui('toggle').textContent, '停止辅助');
+  assert.equal(second.stats().pauses, 0); first.close(); second.close();
 });
 test('auto-next never navigates on ended without platform confirmation', async () => {
   const s = await make({ settings: { autoNext: true } });
@@ -242,15 +262,16 @@ test('unrelated domains are untouched even with identical HTML', async () => {
   assert.equal(s.w.document.getElementById('uibe-learning-helper'), null); s.close();
 });
 test('production source has no seeking, rate changes, network calls or page-timer cancellation', () => {
-  assert.doesNotMatch(content, /(?:currentTime|playbackRate)\s*=/);
-  assert.doesNotMatch(content, /\b(?:fetch|XMLHttpRequest|WebSocket|eval|clearInterval|clearTimeout)\s*\(/);
-  assert.doesNotMatch(content, /document\.(?:cookie|hidden|visibilityState)\s*=(?!=|>)/);
+  const runtimeSource = content + site + fs.readFileSync(path.join(folder, 'background.js'), 'utf8');
+  assert.doesNotMatch(runtimeSource, /(?:currentTime|playbackRate)\s*=/);
+  assert.doesNotMatch(runtimeSource, /\b(?:fetch|XMLHttpRequest|WebSocket|eval|clearInterval|clearTimeout)\s*\(/);
+  assert.doesNotMatch(runtimeSource, /document\.(?:cookie|hidden|visibilityState)\s*=(?!=|>)/);
   const manifest = JSON.parse(fs.readFileSync(path.join(folder, 'manifest.json')));
   assert.deepEqual(manifest.permissions, ['storage']); assert.equal(manifest.manifest_version, 3);
   assert.ok(manifest.content_scripts[0].matches.every(url => /^https?:\/\/jjfz\.uibe\.edu\.cn\//.test(url)));
 });
-test('background serializes concurrent starts and grants only one owner', async () => {
-  const data = {}, listeners = [], notices = [];
+test('background retains independent concurrent tab sessions and workflows', async () => {
+  const data = {}, listeners = [], removed = [];
   const chrome = {
     runtime: { onMessage: { addListener(fn) { listeners.push(fn); } } },
     storage: { session: {
@@ -258,21 +279,120 @@ test('background serializes concurrent starts and grants only one owner', async 
       set: async value => Object.assign(data, value),
       remove: async key => { delete data[key]; }
     } },
-    tabs: { sendMessage: async (id, message) => notices.push({ id, message }), onRemoved: { addListener() {} } }
+    tabs: { onRemoved: { addListener(fn) { removed.push(fn); } } }
   };
   vm.runInNewContext(fs.readFileSync(path.join(folder, 'background.js'), 'utf8'), { chrome });
-  const send = (id, type) => new Promise(resolve => listeners[0]({ type }, { tab: { id } }, resolve));
+  const send = (id, type, extra = {}) => new Promise(resolve => listeners[0]({ type, ...extra }, { tab: { id } }, resolve));
   await Promise.all([send(1, 'start'), send(2, 'start')]);
-  assert.equal(data.automationOwner, 2); assert.equal(notices[0].id, 1);
-  assert.equal((await send(1, 'state')).running, false);
+  assert.equal((await send(1, 'state')).running, true);
   assert.equal((await send(2, 'state')).running, true);
-  await send(1, 'stop'); assert.equal(data.automationOwner, 2);
-  await send(2, 'stop'); assert.equal(data.automationOwner, null);
+  await send(1, 'updateWorkflow', { workflow: { index: 2 } });
+  assert.equal((await send(1, 'state')).workflow.index, 2);
+  assert.equal((await send(2, 'state')).workflow, null);
+  await send(1, 'stop'); assert.equal((await send(2, 'state')).running, true);
+  assert.equal((await send(1, 'state')).running, false);
+  removed[0](1); await send(2, 'state');
+  assert.equal(data.tabSessions['1'], undefined);
+  assert.equal((await send(2, 'state')).running, true);
 });
 
 test('public package metadata uses UIBE jjfz branding', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(folder, 'manifest.json')));
   assert.equal(manifest.name, 'UIBE jjfz 学习助手');
-  assert.equal(manifest.version, '1.0.1');
+  assert.equal(manifest.version, '1.1.0');
   for (const file of ['content.js', 'help.html']) assert.ok(fs.readFileSync(path.join(folder, file), 'utf8').includes(manifest.name));
+});
+
+test('paused playback automatically resumes without changing speed or time', async () => {
+  const s = await make({ initialPaused: true });
+  assert.equal(s.stats().autoplay, 1); assert.equal(s.video.paused, false);
+  s.setPaused(true); s.advanceClock(3000); await s.tick();
+  assert.equal(s.stats().autoplay, 2); s.close();
+});
+test('auto-resume preference can be disabled', async () => {
+  const s = await make({ initialPaused: true, settings: { autoResume: false } });
+  await s.tick(); assert.equal(s.stats().autoplay, 0); assert.equal(s.video.paused, true); s.close();
+});
+test('background paused playback is not forcibly resumed', async () => {
+  const s = await make({ initialPaused: true, hidden: true });
+  await s.tick(); assert.equal(s.stats().autoplay, 0); s.close();
+});
+test('browser autoplay denial exposes one manual button instead of retrying continuously', async () => {
+  const s = await make({ initialPaused: true, denied: true });
+  await s.tick(); assert.equal(s.stats().autoplay, 1); assert.equal(s.ui('playNow').hidden, false);
+  s.advanceClock(10000); await s.tick(); assert.equal(s.stats().autoplay, 1);
+  s.allowPlay(); s.ui('playNow').click(); await s.tick();
+  assert.equal(s.stats().autoplay, 2); assert.equal(s.video.paused, false); assert.equal(s.ui('playNow').hidden, true); s.close();
+});
+test('continuation modal closes before auto-resume is attempted', async () => {
+  const s = await make(), d = s.dialog('视频已暂停，点击按钮后继续学习！');
+  s.setPaused(true); d.box.querySelector('a').addEventListener('click', () => d.box.remove());
+  await s.tick(); assert.equal(s.stats().autoplay, 0);
+  await s.tick(); assert.equal(s.stats().autoplay, 1); s.close();
+});
+test('an unknown prompt prevents auto-resume', async () => {
+  const s = await make(); s.setPaused(true); s.dialog('请阅读这个新提示', ['继续']);
+  await s.tick(); assert.equal(s.stats().autoplay, 0); s.close();
+});
+test('a video that has ended is not automatically restarted', async () => {
+  const s = await make(); s.finish(); s.advanceClock(3000); await s.tick();
+  assert.equal(s.stats().autoplay, 0); s.close();
+});
+test('a player without buffered metadata waits rather than repeatedly calling play', async () => {
+  const s = await make(); s.setPaused(true);
+  Object.defineProperty(s.video, 'readyState', { configurable: true, get: () => 0 });
+  await s.tick(); assert.equal(s.stats().autoplay, 0); assert.equal(s.ui('status').dataset.fault, 'false'); s.close();
+});
+test('a course-list panel entry enables assistance before attempting video navigation', async () => {
+  const s = await make({ html: savedLesson, url: 'http://jjfz.uibe.edu.cn/jjfz/lesson/video?lesson_id=10', running: false });
+  s.ui('catalog').querySelector('a[href*="v_id=102"]').click(); await s.tick();
+  assert.ok(s.requests.some(request => request.type === 'start'));
+  assert.ok(s.requests.some(request => request.type === 'updateWorkflow'));
+  assert.equal(s.browserErrors.length, 1); s.close();
+});
+test('course cards contain a direct enter-and-assist action', async () => {
+  const s = await make({ html: savedLesson, url: 'http://jjfz.uibe.edu.cn/jjfz/lesson/video?lesson_id=10', running: false });
+  const buttons = [...s.w.document.querySelectorAll('[data-uibe-entry]')];
+  assert.equal(buttons.length, 5);
+  buttons.find(button => !button.disabled).click(); await s.tick();
+  assert.ok(s.requests.some(request => request.type === 'start')); assert.equal(s.browserErrors.length, 1); s.close();
+});
+test('hub start captures all unfinished chapters and preserves the queue before navigation', async () => {
+  const html = fs.readFileSync(path.join(__dirname, 'fixtures/hub.html'), 'utf8');
+  const s = await make({ html, url: 'http://jjfz.uibe.edu.cn/jjfz/lesson', running: false });
+  assert.equal(s.ui('catalog').children.length, 3);
+  s.ui('toggle').click(); await s.tick();
+  const start = s.requests.find(request => request.type === 'start');
+  assert.equal(start.workflow.chapters.length, 2);
+  assert.equal(start.workflow.chapters[0].lessonId, '10');
+  assert.equal(s.browserErrors.length, 1); s.close();
+});
+test('a hub card can independently start just that chapter', async () => {
+  const html = fs.readFileSync(path.join(__dirname, 'fixtures/hub.html'), 'utf8');
+  const s = await make({ html, url: 'http://jjfz.uibe.edu.cn/jjfz/lesson', running: false });
+  s.w.document.querySelectorAll('[data-uibe-entry]')[1].click(); await s.tick();
+  const start = s.requests.find(request => request.type === 'start');
+  assert.equal(start.workflow.chapters.length, 1); assert.equal(start.workflow.chapters[0].lessonId, '20'); s.close();
+});
+test('starting from a chapter page selects its premium-video tab', async () => {
+  const html = fs.readFileSync(path.join(__dirname, 'fixtures/chapter.html'), 'utf8');
+  const s = await make({ html, url: 'http://jjfz.uibe.edu.cn/jjfz/lesson/lecture?lesson_id=10', running: false });
+  s.ui('toggle').click(); await s.tick();
+  assert.equal(s.browserErrors.length, 1);
+  assert.match(s.ui('logs').textContent, /lesson\/video/); s.close();
+});
+test('required workflow resumes normal playback on arrival at a video', async () => {
+  const workflow = { kind: 'required', chapters: [{ lessonId: '10', title: '章一', href: 'http://jjfz.uibe.edu.cn/jjfz/lesson/lecture?lesson_id=10' }], index: 0, listUrl: 'http://jjfz.uibe.edu.cn/jjfz/lesson/video?lesson_id=10&required=1' };
+  const s = await make({ workflow, initialPaused: true });
+  assert.equal(s.stats().autoplay, 1); assert.equal(s.browserErrors.length, 0); s.close();
+});
+
+test('standalone course completion badges are respected by list entry actions', async () => {
+  const s = await make({ html: savedLesson, url: 'http://jjfz.uibe.edu.cn/jjfz/lesson/video?lesson_id=10', running: false });
+  const card = s.w.document.querySelector('a[href*="v_id=102"]').closest('li');
+  const badge = s.w.document.createElement('div'); badge.className = 'lesson_pass'; badge.textContent = '完成'; card.append(badge);
+  await s.tick();
+  assert.equal(card.querySelector('[data-uibe-entry]').disabled, true);
+  assert.equal(s.ui('catalog').querySelector('a[href*="v_id=102"]').parentElement.querySelector('small').textContent, '平台已标记完成');
+  s.close();
 });
